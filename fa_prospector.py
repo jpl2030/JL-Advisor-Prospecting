@@ -150,7 +150,15 @@ def search_brokercheck(zip_code, start=0, rows=50):
                     time.sleep(RETRY_DELAY * attempt)
                     continue
                 return None
-            data = resp.json()
+        data = resp.json()
+            # DEBUG — print raw response for first call only
+            import os as _os2
+            if _os2.environ.get("DEBUG_FIRST_CALL") == "1":
+                import json as _json2
+                print("\n=== RAW API RESPONSE ===")
+                print(_json2.dumps(data, indent=2)[:3000])
+                print("=== END RAW RESPONSE ===\n")
+                _os2.environ["DEBUG_FIRST_CALL"] = "0"
             if "hits" not in data:
                 print(f"    [!] Unexpected response for zip {zip_code}: "
                       f"{str(data)[:200]}")
