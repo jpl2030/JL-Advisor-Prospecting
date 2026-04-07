@@ -194,13 +194,8 @@ def run_investment_professionals(state="FL", limit=5000):
         )
         raw = results_resp.json()
 
-        # DEBUG: print raw structure so we can see exactly what the actor returns
-        import json as _j
-        print("\n=== RAW DATASET RESPONSE (first 3000 chars) ===")
-        print(_j.dumps(raw, indent=2)[:3000])
-        print("=== END RAW ===\n")
-
-        # Try every plausible nesting pattern
+        # Extract contacts from nested response structure
+        # Verified structure: [{query_type, contacts: {results: {contacts: [...]}}}]
         contacts = []
         items = raw if isinstance(raw, list) else [raw]
         for item in items:
@@ -278,7 +273,7 @@ def collect_prospects():
     print(f"  Source: Apify Investment Finance Professionals")
     print(f"{'='*60}\n")
 
-    contacts = run_investment_professionals(state="FL", limit=400)  # $4.02 at $0.01/contact
+    contacts = run_investment_professionals(state="FL", limit=500)  # $5.02 at $0.01/contact
 
     if not contacts:
         print("  No contacts returned.")
@@ -531,9 +526,9 @@ def build_pdf(prospects, output_path):
         Paragraph("<b>Yrs In</b>", small_style),
         Paragraph("<b>Discl.</b>", small_style),
         Paragraph("<b>Licenses</b>", small_style),
-        Paragraph("<b>Phone [FILL]</b>", small_style),
-        Paragraph("<b>Email [FILL]</b>", small_style),
-        Paragraph("<b>LinkedIn [FILL]</b>", small_style),
+        Paragraph("<b>Phone</b>", small_style),
+        Paragraph("<b>Email</b>", small_style),
+        Paragraph("<b>LinkedIn</b>", small_style),
         Paragraph("<b>Notes</b>", small_style),
     ]
 
@@ -565,9 +560,9 @@ def build_pdf(prospects, output_path):
             Paragraph(discl_display, ParagraphStyle("Discl", parent=cell_style,
                                                      textColor=discl_color, fontName="Helvetica-Bold", fontSize=8)),
             Paragraph(p["licenses"][:40] + ("..." if len(p["licenses"]) > 40 else ""), cell_style),
-            Paragraph("", cell_style),  # Phone FILL
-            Paragraph("", cell_style),  # Email FILL
-            Paragraph("", cell_style),  # LinkedIn FILL
+            Paragraph(p.get("phone", ""), cell_style),
+            Paragraph(p.get("email", ""), cell_style),
+            Paragraph(p.get("linkedin", ""), cell_style),
             Paragraph("", cell_style),  # Notes
         ]
         table_data.append(row)
