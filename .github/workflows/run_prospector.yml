@@ -35,6 +35,7 @@ jobs:
       - name: Run FA Prospector
         env:
           REG_YEAR_CUTOFF: ${{ github.event.inputs.reg_year_cutoff || '2000' }}
+          DEBUG_FIRST_CALL: "1"
         run: python fa_prospector.py
 
       - name: Send email with PDF
