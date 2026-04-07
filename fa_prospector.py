@@ -131,10 +131,10 @@ def run_apify_scraper(state="FL", zip_code=None, max_items=500):
     # Build input — search by state
     actor_input = {
         "searchType": "individual",
-        "searchQuery": "",
+        "query": " ",
         "state": state,
+        "includePrevious": False,
         "maxItems": max_items,
-        "includeDisclosures": True,
     }
 
     # Start the run
