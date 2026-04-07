@@ -1,0 +1,49 @@
+name: FA Prospector — Monthly Run
+
+on:
+  schedule:
+    # Runs at 7:00 AM ET on the 1st of every month
+    - cron: "0 12 1 * *"
+  workflow_dispatch:
+    # Also allows manual trigger from GitHub Actions tab
+    inputs:
+      reg_year_cutoff:
+        description: "Registration year cutoff (default 2000)"
+        required: false
+        default: "2000"
+
+jobs:
+  prospect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests reportlab
+
+      - name: Run FA Prospector
+        env:
+          REG_YEAR_CUTOFF: ${{ github.event.inputs.reg_year_cutoff || '2000' }}
+        run: python fa_prospector.py
+
+      - name: Send email with PDF
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: python send_report.py
+
+      - name: Upload PDF as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FA_Prospect_List_${{ github.run_id }}
+          path: FA_Prospect_List_CentralFlorida.pdf
+          retention-days: 90
