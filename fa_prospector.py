@@ -104,7 +104,7 @@ OUTPUT_FILE = "FA_Prospect_List_CentralFlorida.pdf"
 import os as _os
 
 APIFY_TOKEN = _os.environ.get("APIFY_TOKEN", "")
-APIFY_ACTOR_ID = "parseforge/finra-brokercheck-scraper"
+APIFY_ACTOR_ID = "qpzNdIkGvCmzrYVa8"
 APIFY_BASE = "https://api.apify.com/v2"
 
 HEADERS = {
