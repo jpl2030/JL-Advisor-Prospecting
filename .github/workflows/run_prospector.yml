@@ -12,6 +12,9 @@ on:
         required: false
         default: "2000"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   prospect:
     runs-on: ubuntu-latest
@@ -19,10 +22,10 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.3.0
         with:
           python-version: "3.11"
 
@@ -42,7 +45,7 @@ jobs:
         run: python send_report.py
 
       - name: Upload PDF as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.3
         with:
           name: FA_Prospect_List_${{ github.run_id }}
           path: FA_Prospect_List_CentralFlorida.pdf
