@@ -1,9 +1,6 @@
 name: FA Prospector — Monthly Run
 
 on:
-  schedule:
-    # Runs at 7:00 AM ET on the 1st of every month
-    - cron: "0 12 1 * *"
   workflow_dispatch:
     # Also allows manual trigger from GitHub Actions tab
     inputs:
