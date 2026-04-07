@@ -94,67 +94,106 @@ API_DELAY = 0.5
 OUTPUT_FILE = "FA_Prospect_List_CentralFlorida.pdf"
 
 # ─────────────────────────────────────────────
-# SEC FORM ADV BULK CSV DOWNLOAD
+# APIFY BROKERCHECK SCRAPER
 # ─────────────────────────────────────────────
-# The SEC publishes complete Form ADV data as downloadable ZIP/CSV files.
-# No API key, no auth, no IP blocking — just a direct file download.
-# Individual representatives are in the IA_REP table.
-# Published at: https://adviserinfo.sec.gov/adv
+# Uses Apify's BrokerCheck scraper actor which handles all
+# IP rotation and browser simulation. Requires an Apify API token
+# stored as APIFY_TOKEN GitHub secret. Free tier: 5 USD/month credit.
+# Actor: https://apify.com/parseforge/finra-brokercheck-scraper
 
-import io
-import zipfile
-import csv
+import os as _os
+
+APIFY_TOKEN = _os.environ.get("APIFY_TOKEN", "")
+APIFY_ACTOR_ID = "parseforge/finra-brokercheck-scraper"
+APIFY_BASE = "https://api.apify.com/v2"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FA-Prospector/1.0; research@example.com)",
-    "Accept": "*/*",
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {APIFY_TOKEN}",
 }
 
-# The SEC ADV bulk data ZIP — individual representatives table
-# This URL is stable and updated daily by the SEC
-ADV_REP_URL = "https://files.adviserinfo.sec.gov/IAPD/Content/Common/crd_iapd_Current_1A_InvAdvrRep.zip"
-
-# Retry settings
 MAX_RETRIES = 3
 RETRY_DELAY = 5
+POLL_INTERVAL = 15  # seconds between run status checks
+MAX_POLL_WAIT = 900  # 15 minutes max
 
 
-def download_adv_reps():
+def run_apify_scraper(state="FL", zip_code=None, max_items=500):
     """
-    Download and parse the SEC Form ADV individual representatives CSV.
-    Returns list of row dicts or None on failure.
+    Start an Apify BrokerCheck scraper run and wait for results.
+    Returns list of broker records or None on failure.
     """
-    print("  Downloading SEC Form ADV representatives dataset...")
-    for attempt in range(1, MAX_RETRIES + 1):
+    if not APIFY_TOKEN:
+        print("  ERROR: APIFY_TOKEN secret not set in GitHub Actions.")
+        print("  Add it via: Settings -> Secrets -> New secret -> APIFY_TOKEN")
+        return None
+
+    # Build input — search by state
+    actor_input = {
+        "searchType": "individual",
+        "searchQuery": "",
+        "state": state,
+        "maxItems": max_items,
+        "includeDisclosures": True,
+    }
+
+    # Start the run
+    print(f"  Starting Apify BrokerCheck scraper (state={state}, max={max_items})...")
+    try:
+        resp = requests.post(
+            f"{APIFY_BASE}/acts/{APIFY_ACTOR_ID}/runs",
+            json=actor_input,
+            headers=HEADERS,
+            timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            print(f"  ERROR starting run: HTTP {resp.status_code}: {resp.text[:300]}")
+            return None
+
+        run_id = resp.json()["data"]["id"]
+        print(f"  Run started: {run_id}")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        return None
+
+    # Poll until finished
+    elapsed = 0
+    while elapsed < MAX_POLL_WAIT:
+        time.sleep(POLL_INTERVAL)
+        elapsed += POLL_INTERVAL
+
         try:
-            resp = requests.get(
-                ADV_REP_URL, headers=HEADERS,
-                timeout=120, stream=True
+            status_resp = requests.get(
+                f"{APIFY_BASE}/actor-runs/{run_id}",
+                headers=HEADERS,
+                timeout=15,
             )
-            print(f"  HTTP {resp.status_code} — ", end="", flush=True)
-            if resp.status_code == 200:
-                raw = resp.content
-                print(f"{len(raw):,} bytes downloaded")
-                zf = zipfile.ZipFile(io.BytesIO(raw))
-                # Find the CSV inside the zip
-                csv_name = [n for n in zf.namelist() if n.lower().endswith('.csv')][0]
-                print(f"  Parsing {csv_name}...")
-                with zf.open(csv_name) as f:
-                    reader = csv.DictReader(io.TextIOWrapper(f, encoding='utf-8', errors='replace'))
-                    rows = list(reader)
-                print(f"  Total rows in dataset: {len(rows):,}")
-                return rows
-            else:
-                print(f"failed: {resp.text[:200]}")
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY * attempt)
+            status = status_resp.json()["data"]["status"]
+            print(f"  [{elapsed}s] Run status: {status}")
+
+            if status == "SUCCEEDED":
+                break
+            elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
+                print(f"  Run ended with status: {status}")
+                return None
         except Exception as e:
-            print(f"Error (attempt {attempt}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY * attempt)
-    return None
+            print(f"  Polling error: {e}")
 
-
+    # Fetch dataset results
+    print("  Fetching results...")
+    try:
+        dataset_id = status_resp.json()["data"]["defaultDatasetId"]
+        results_resp = requests.get(
+            f"{APIFY_BASE}/datasets/{dataset_id}/items?format=json&clean=true",
+            headers=HEADERS,
+            timeout=60,
+        )
+        records = results_resp.json()
+        print(f"  Downloaded {len(records)} records from Apify")
+        return records
+    except Exception as e:
+        print(f"  ERROR fetching results: {e}")
+        return None
 def zip_in_central_florida(zip_code):
     """Return True if the zip code is in our Central Florida target list."""
     return str(zip_code).strip()[:5] in set(CENTRAL_FLORIDA_ZIPS)
@@ -191,105 +230,62 @@ def firm_excluded(firm_name):
 
 def collect_prospects():
     """
-    Download SEC Form ADV bulk CSV, filter for Central FL zip codes,
-    tenure cutoff, and firm exclusions.
+    Pull FL advisors via Apify BrokerCheck scraper,
+    then filter for Central FL zips, tenure, and firm exclusions.
     """
     print(f"\n{'='*60}")
     print(f"  FA PROSPECTOR — Central Florida")
     print(f"  Registration cutoff: before {REGISTRATION_YEAR_CUTOFF}")
-    print(f"  Source: SEC Form ADV bulk CSV download")
+    print(f"  Source: Apify BrokerCheck Scraper")
     print(f"{'='*60}\n")
 
-    rows = download_adv_reps()
+    records = run_apify_scraper(state="FL", max_items=1000)
 
-    if rows is None:
-        print("  Failed to download SEC dataset.")
+    if not records:
+        print("  No records returned from Apify.")
         return []
 
-    if rows:
-        print("\n=== COLUMN NAMES IN DATASET ===")
-        print(list(rows[0].keys())[:30])
-        print("=== FIRST ROW SAMPLE ===")
-        import json as _j
-        print(_j.dumps(dict(list(rows[0].items())[:20]), indent=2))
-        print("=== END SAMPLE ===\n")
+    # Debug: print first record field names
+    import json as _j
+    print("\n=== FIRST RECORD SAMPLE ===")
+    print(_j.dumps(records[0], indent=2)[:1500])
+    print("=== END SAMPLE ===\n")
 
     all_prospects = []
     seen_ids = set()
-    fl_count = 0
-    zip_count = 0
-    tenure_count = 0
-    firm_count = 0
 
-    print(f"  Filtering {len(rows):,} records...")
-
-    for row in rows:
-        # Try multiple possible column names for each field
-        # (SEC CSV column names vary — debug sample will confirm exact names)
-        ind_id = str(
-            row.get("CRDNumber") or row.get("IndvlId") or
-            row.get("CRD_NUMBER") or row.get("indvl_id") or ""
-        ).strip()
-
+    for rec in records:
+        ind_id = str(rec.get("crdNumber") or rec.get("indvlId") or rec.get("id") or "").strip()
         if not ind_id or ind_id in seen_ids:
             continue
         seen_ids.add(ind_id)
 
-        # State filter — Florida only
-        state = str(
-            row.get("StateCode") or row.get("state_cd") or
-            row.get("State") or row.get("STATE") or ""
-        ).strip().upper()
-        if state != "FL":
-            continue
-        fl_count += 1
-
-        # Zip filter — Central Florida only
-        zip_val = str(
-            row.get("ZipCode") or row.get("zip_cd") or
-            row.get("Zip") or row.get("ZIP") or ""
-        ).strip()[:5]
+        # Geography filter
+        zip_val = str(rec.get("zipCode") or rec.get("zip") or "").strip()[:5]
         if not zip_in_central_florida(zip_val):
             continue
-        zip_count += 1
 
-        # Firm exclusion
-        firm = str(
-            row.get("FirmName") or row.get("firm_name") or
-            row.get("OrgNm") or row.get("ORG_NM") or ""
-        ).strip()
+        first = str(rec.get("firstName") or rec.get("first_name") or "").strip().title()
+        last  = str(rec.get("lastName")  or rec.get("last_name")  or "").strip().title()
+        full_name = f"{first} {last}".strip() or "Unknown"
+
+        firm = str(rec.get("currentFirm") or rec.get("firmName") or rec.get("employer") or "").strip()
         if firm_excluded(firm):
             continue
-        firm_count += 1
 
-        # Tenure filter
-        reg_date_raw = str(
-            row.get("RegistrationDate") or row.get("reg_dt") or
-            row.get("InitialRegistrationDate") or row.get("INIT_REG_DT") or ""
-        ).strip()
+        reg_date_raw = str(rec.get("registrationDate") or rec.get("firstRegistrationDate") or "").strip()
         reg_year = parse_registration_year(reg_date_raw)
         if reg_year and reg_year >= REGISTRATION_YEAR_CUTOFF:
             continue
-        tenure_count += 1
 
-        first = str(
-            row.get("FirstName") or row.get("first_nm") or
-            row.get("FIRST_NM") or ""
-        ).strip().title()
-        last = str(
-            row.get("LastName") or row.get("last_nm") or
-            row.get("LAST_NM") or ""
-        ).strip().title()
-        full_name = f"{first} {last}".strip() or "Unknown"
-
-        city = str(
-            row.get("City") or row.get("city") or
-            row.get("CITY") or ""
-        ).strip().title()
+        city = str(rec.get("city") or "").strip().title()
+        has_disclosures = bool(rec.get("hasDisclosures") or rec.get("disclosures"))
+        disclosures_count = int(rec.get("disclosureCount") or 0)
+        licenses = str(rec.get("licenses") or rec.get("examNames") or "N/A")
 
         broker_url = f"https://brokercheck.finra.org/individual/summary/{ind_id}"
 
-        prospect = {
+        all_prospects.append({
             "name":              full_name,
             "first":             first,
             "last":              last,
@@ -301,26 +297,18 @@ def collect_prospects():
             "reg_year":          reg_year,
             "reg_date_raw":      reg_date_raw,
             "years_in_industry": (datetime.now().year - reg_year) if reg_year else None,
-            "has_disclosures":   False,
-            "disclosures_count": 0,
-            "licenses":          "N/A",
+            "has_disclosures":   has_disclosures,
+            "disclosures_count": disclosures_count,
+            "licenses":          licenses[:80],
             "brokercheck_url":   broker_url,
             "phone":             "",
             "email":             "",
             "linkedin":          "",
             "notes":             "",
-        }
-        all_prospects.append(prospect)
+        })
 
     all_prospects.sort(key=lambda x: x.get("reg_year") or 9999)
-
-    print(f"\n  Filter funnel:")
-    print(f"    Total rows:          {len(rows):>6,}")
-    print(f"    Florida reps:        {fl_count:>6,}")
-    print(f"    Central FL zips:     {zip_count:>6,}")
-    print(f"    After firm filter:   {firm_count:>6,}")
-    print(f"    After tenure filter: {tenure_count:>6,}")
-    print(f"\n✅ Final prospect count: {len(all_prospects):,}")
+    print(f"\n✅ Total qualified prospects: {len(all_prospects)}")
     return all_prospects
 
 # ─────────────────────────────────────────────
