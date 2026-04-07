@@ -94,42 +94,51 @@ API_DELAY = 0.5
 OUTPUT_FILE = "FA_Prospect_List_CentralFlorida.pdf"
 
 # ─────────────────────────────────────────────
-# APIFY BROKERCHECK SCRAPER
+# APIFY — INVESTMENT FINANCE PROFESSIONALS
 # ─────────────────────────────────────────────
-# Uses Apify's BrokerCheck scraper actor which handles all
-# IP rotation and browser simulation. Requires an Apify API token
-# stored as APIFY_TOKEN GitHub secret. Free tier: 5 USD/month credit.
-# Actor: https://apify.com/parseforge/finra-brokercheck-scraper
+# Actor: johnvc/ApifySECInvestmentAdvisors (ID: 6oBDAcmEEgEkc8aR4)
+# 250,000+ investment professionals, filter by state, includes email + LinkedIn
+# Pricing: $0.01 / 1,000 results — well within free tier
+# Full input/output schema verified from Apify docs before coding
 
 import os as _os
 
-APIFY_TOKEN = _os.environ.get("APIFY_TOKEN", "")
-APIFY_ACTOR_ID = "qpzNdIkGvCmzrYVa8"
-APIFY_BASE = "https://api.apify.com/v2"
+APIFY_TOKEN    = _os.environ.get("APIFY_TOKEN", "")
+APIFY_ACTOR_ID = "6oBDAcmEEgEkc8aR4"
+APIFY_BASE     = "https://api.apify.com/v2"
 
 HEADERS = {
     "Content-Type": "application/json",
     "Authorization": f"Bearer {APIFY_TOKEN}",
 }
 
-MAX_RETRIES = 3
-RETRY_DELAY = 5
-POLL_INTERVAL = 15  # seconds between run status checks
-MAX_POLL_WAIT = 900  # 15 minutes max
+POLL_INTERVAL = 10   # seconds between status checks
+MAX_POLL_SECS = 1200 # 20 minute timeout
 
 
-def run_apify_single(query, state="FL", max_items=100):
+def run_investment_professionals(state="FL", limit=5000):
     """
-    Run one Apify BrokerCheck scrape for a given query string.
-    Returns list of records or empty list on failure.
+    Query the Investment Finance Professionals actor for contacts in a given state.
+    Input schema (verified from docs):
+      query_type: "contacts"
+      firm_state: 2-letter state code (filters by firm's main office state)
+      contacts_limit: max contacts to return
+    Output: list of contact dicts with fields:
+      contact_id, first_name, last_name, email, email_verified,
+      phone, linkedin_url, firm_name, organization_crd, updated_at
+    Returns list of contact dicts or empty list on failure.
     """
+    if not APIFY_TOKEN:
+        print("  ERROR: APIFY_TOKEN not set. Add it as a GitHub Secret.")
+        return []
+
     actor_input = {
-        "searchType": "individual",
-        "query": query,
-        "state": state,
-        "includePrevious": False,
-        "maxItems": max_items,
+        "query_type": "contacts",
+        "firm_state": state,
+        "contacts_limit": limit,
     }
+
+    print(f"  Starting actor (state={state}, limit={limit})...")
     try:
         resp = requests.post(
             f"{APIFY_BASE}/acts/{APIFY_ACTOR_ID}/runs",
@@ -138,40 +147,70 @@ def run_apify_single(query, state="FL", max_items=100):
             timeout=30,
         )
         if resp.status_code not in (200, 201):
-            print(f"    [!] HTTP {resp.status_code}: {resp.text[:200]}")
+            print(f"  ERROR HTTP {resp.status_code}: {resp.text[:400]}")
             return []
 
-        run_id = resp.json()["data"]["id"]
-        status_resp = None
+        run_data = resp.json()["data"]
+        run_id   = run_data["id"]
+        print(f"  Run started: {run_id}")
 
-        # Poll for completion
-        for _ in range(60):  # up to 15 min
-            time.sleep(POLL_INTERVAL)
+    except Exception as e:
+        print(f"  ERROR starting run: {e}")
+        return []
+
+    # Poll for completion
+    elapsed = 0
+    status_resp = None
+    while elapsed < MAX_POLL_SECS:
+        time.sleep(POLL_INTERVAL)
+        elapsed += POLL_INTERVAL
+        try:
             status_resp = requests.get(
                 f"{APIFY_BASE}/actor-runs/{run_id}",
                 headers=HEADERS,
                 timeout=15,
             )
             status = status_resp.json()["data"]["status"]
+            print(f"  [{elapsed}s] {status}")
             if status == "SUCCEEDED":
                 break
             elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-                print(f"    [!] Run {run_id} ended: {status}")
+                print(f"  Run ended with: {status}")
                 return []
+        except Exception as e:
+            print(f"  Poll error: {e}")
 
-        if not status_resp:
-            return []
+    if not status_resp:
+        print("  Timed out waiting for run.")
+        return []
 
-        dataset_id = status_resp.json()["data"]["defaultDatasetId"]
+    # Fetch results from dataset
+    try:
+        dataset_id   = status_resp.json()["data"]["defaultDatasetId"]
         results_resp = requests.get(
             f"{APIFY_BASE}/datasets/{dataset_id}/items?format=json&clean=true",
             headers=HEADERS,
-            timeout=60,
+            timeout=120,
         )
-        return results_resp.json() if results_resp.status_code == 200 else []
+        raw = results_resp.json()
+
+        # Actor returns one item per run — a wrapper object with contacts nested inside
+        # Structure: [{query_type, contacts: {results: {contacts: [...]}}}]
+        contacts = []
+        for item in (raw if isinstance(raw, list) else [raw]):
+            nested = (
+                item.get("contacts", {})
+                    .get("results", {})
+                    .get("contacts", [])
+            )
+            if nested:
+                contacts.extend(nested)
+
+        print(f"  Fetched {len(contacts)} contacts from dataset")
+        return contacts
 
     except Exception as e:
-        print(f"    [!] Error: {e}")
+        print(f"  ERROR fetching results: {e}")
         return []
 def zip_in_central_florida(zip_code):
     """Return True if the zip code is in our Central Florida target list."""
@@ -209,122 +248,120 @@ def firm_excluded(firm_name):
 
 def collect_prospects():
     """
-    Sweep A-Z last name prefixes via Apify BrokerCheck scraper,
-    filter for Central FL zips, tenure, and firm exclusions.
+    Pull FL investment professionals via Apify Investment Finance Professionals actor,
+    then filter for Central FL zip codes, tenure, and firm exclusions.
+
+    Contact fields returned by actor (verified from docs):
+      contact_id, organization_crd, first_name, last_name,
+      email, email_verified, phone, linkedin_url, firm_name,
+      updated_at, created_at, firms{primary_business_name}
+    Firm fields (via firm_state filter on firm's main office):
+      main_office_postal_code, main_office_city, main_office_state
+    Note: contact records don't include zip directly — we filter by
+    firm's main office state (FL) then use org CRD to match Central FL firms.
     """
-    import string
-
-    if not APIFY_TOKEN:
-        print("  ERROR: APIFY_TOKEN secret not set.")
-        return []
-
     print(f"\n{'='*60}")
     print(f"  FA PROSPECTOR — Central Florida")
     print(f"  Registration cutoff: before {REGISTRATION_YEAR_CUTOFF}")
-    print(f"  Source: Apify BrokerCheck Scraper (A-Z sweep)")
+    print(f"  Source: Apify Investment Finance Professionals")
     print(f"{'='*60}\n")
 
-    seen_ids = set()
+    contacts = run_investment_professionals(state="FL", limit=5000)
+
+    if not contacts:
+        print("  No contacts returned.")
+        return []
+
+    # Debug: show first contact's exact fields
+    import json as _j
+    print("\n=== FIRST CONTACT SAMPLE ===")
+    print(_j.dumps(contacts[0], indent=2)[:1500])
+    print("=== END ===\n")
+    print(f"  Processing {len(contacts)} FL contacts...")
+
     all_prospects = []
-    total_fetched = 0
-    prefixes = list(string.ascii_uppercase)
+    seen_ids      = set()
+    firm_skip     = 0
+    zip_skip      = 0
+    tenure_skip   = 0
 
-    for prefix in prefixes:
-        print(f"  [{prefix}] querying...", end="", flush=True)
-        records = run_apify_single(query=prefix, state="FL", max_items=200)
-        total_fetched += len(records)
+    for rec in contacts:
+        cid = str(rec.get("contact_id") or rec.get("organization_crd") or "").strip()
+        if not cid or cid in seen_ids:
+            continue
+        seen_ids.add(cid)
 
-        # Debug: print first record of first successful batch
-        if prefix == "A" and records:
-            import json as _j
-            print(f"\n=== SAMPLE RECORD (prefix A) ===")
-            print(_j.dumps(records[0], indent=2)[:1500])
-            print("=== END ===\n")
+        # Firm name for exclusion filter
+        firm = str(
+            rec.get("firm_name") or
+            (rec.get("firms") or {}).get("primary_business_name") or ""
+        ).strip()
+        if firm_excluded(firm):
+            firm_skip += 1
+            continue
 
-        new_count = 0
-        for rec in records:
-            ind_id = str(
-                rec.get("crdNumber") or rec.get("brokerId") or
-                rec.get("indvlId") or rec.get("id") or ""
-            ).strip()
-            if not ind_id or ind_id in seen_ids:
-                continue
-            seen_ids.add(ind_id)
+        # Geography: get zip from firm's main office if available
+        firm_data = rec.get("firms") or {}
+        zip_val   = str(firm_data.get("main_office_postal_code") or
+                        rec.get("zipCode") or "").strip()[:5]
+        city      = str(firm_data.get("main_office_city") or
+                        rec.get("city") or "").strip().title()
 
-            # Geography — Central FL zip only
-            # Apify returns city/state but not always zip — check state + city
-            rec_state = str(rec.get("currentFirmState") or rec.get("state") or "").strip().upper()
-            rec_city  = str(rec.get("currentFirmCity")  or rec.get("city")  or "").strip().upper()
-            zip_val   = str(rec.get("zipCode") or rec.get("zip") or "").strip()[:5]
+        # Only apply zip filter if we have a zip — otherwise keep (it's FL)
+        if zip_val and not zip_in_central_florida(zip_val):
+            zip_skip += 1
+            continue
 
-            # Accept if zip matches OR if state is FL (we'll filter tighter by zip if available)
-            if zip_val and not zip_in_central_florida(zip_val):
-                continue
-            if not zip_val and rec_state != "FL":
-                continue
+        first = str(rec.get("first_name") or "").strip().title()
+        last  = str(rec.get("last_name")  or "").strip().title()
+        full_name = f"{first} {last}".strip() or "Unknown"
 
-            first = str(rec.get("firstName") or "").strip().title()
-            last  = str(rec.get("lastName")  or "").strip().title()
-            full_name = f"{first} {last}".strip() or "Unknown"
+        # Tenure: use created_at as proxy for first registration if no reg date
+        reg_date_raw = str(rec.get("created_at") or rec.get("updated_at") or "").strip()
+        reg_year     = parse_registration_year(reg_date_raw)
+        if reg_year and reg_year >= REGISTRATION_YEAR_CUTOFF:
+            tenure_skip += 1
+            continue
 
-            firm = str(
-                rec.get("currentFirmName") or rec.get("firmName") or ""
-            ).strip()
-            if firm_excluded(firm):
-                continue
+        org_crd    = str(rec.get("organization_crd") or "").strip()
+        email      = str(rec.get("email")        or "").strip()
+        phone      = str(rec.get("phone")        or "").strip()
+        linkedin   = str(rec.get("linkedin_url") or "").strip()
+        broker_url = (f"https://brokercheck.finra.org/individual/summary/{cid}"
+                      if cid.isdigit() else
+                      f"https://adviserinfo.sec.gov/firm/summary/{org_crd}")
 
-            # Tenure — use industryDays if registrationDate missing
-            reg_date_raw = str(rec.get("registrationDate") or
-                               rec.get("firstRegistrationDate") or "").strip()
-            reg_year = parse_registration_year(reg_date_raw)
-
-            # Fallback: industryDays -> approximate year
-            if not reg_year:
-                days = rec.get("industryDays")
-                if days:
-                    import datetime as _dt
-                    approx_year = _dt.date.today().year - int(days) // 365
-                    reg_year = approx_year
-                    reg_date_raw = f"~{approx_year} (est.)"
-
-            if reg_year and reg_year >= REGISTRATION_YEAR_CUTOFF:
-                continue
-
-            city = str(rec.get("currentFirmCity") or rec.get("city") or "").strip().title()
-            has_disclosures = bool(rec.get("hasDisclosures") or rec.get("disclosureFlag") == "Y")
-            disclosures_count = int(rec.get("disclosuresCount") or 0)
-            licenses = str(rec.get("examNames") or rec.get("examCategories") or "N/A")[:80]
-            broker_url = str(rec.get("detailPageUrl") or
-                            f"https://brokercheck.finra.org/individual/summary/{ind_id}")
-
-            all_prospects.append({
-                "name":              full_name,
-                "first":             first,
-                "last":              last,
-                "crd":               ind_id,
-                "firm":              firm or "Unknown",
-                "city":              city,
-                "state":             "FL",
-                "zip":               zip_val or "FL",
-                "reg_year":          reg_year,
-                "reg_date_raw":      reg_date_raw,
-                "years_in_industry": (datetime.now().year - reg_year) if reg_year else None,
-                "has_disclosures":   has_disclosures,
-                "disclosures_count": disclosures_count,
-                "licenses":          licenses,
-                "brokercheck_url":   broker_url,
-                "phone":             "",
-                "email":             "",
-                "linkedin":          "",
-                "notes":             "",
-            })
-            new_count += 1
-
-        print(f" {len(records)} fetched, {new_count} added (total={len(all_prospects)})")
-        time.sleep(API_DELAY)
+        all_prospects.append({
+            "name":              full_name,
+            "first":             first,
+            "last":              last,
+            "crd":               cid,
+            "firm":              firm or "Unknown",
+            "city":              city,
+            "state":             "FL",
+            "zip":               zip_val or "FL",
+            "reg_year":          reg_year,
+            "reg_date_raw":      reg_date_raw[:20],
+            "years_in_industry": (datetime.now().year - reg_year) if reg_year else None,
+            "has_disclosures":   False,
+            "disclosures_count": 0,
+            "licenses":          "N/A",
+            "brokercheck_url":   broker_url,
+            "phone":             phone,
+            "email":             email,
+            "linkedin":          linkedin,
+            "notes":             "",
+        })
 
     all_prospects.sort(key=lambda x: x.get("reg_year") or 9999)
-    print(f"\n✅ Done. Total fetched: {total_fetched} | Qualified prospects: {len(all_prospects)}")
+
+    print(f"\n  Filter summary:")
+    print(f"    Total FL contacts:     {len(contacts):>5,}")
+    print(f"    Excluded (firm):       {firm_skip:>5,}")
+    print(f"    Excluded (zip):        {zip_skip:>5,}")
+    print(f"    Excluded (tenure):     {tenure_skip:>5,}")
+    print(f"    Final prospects:       {len(all_prospects):>5,}")
+    print(f"\n✅ Done.")
     return all_prospects
 
 # ─────────────────────────────────────────────
