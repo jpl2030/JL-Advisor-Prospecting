@@ -194,19 +194,31 @@ def run_investment_professionals(state="FL", limit=5000):
         )
         raw = results_resp.json()
 
-        # Actor returns one item per run — a wrapper object with contacts nested inside
-        # Structure: [{query_type, contacts: {results: {contacts: [...]}}}]
-        contacts = []
-        for item in (raw if isinstance(raw, list) else [raw]):
-            nested = (
-                item.get("contacts", {})
-                    .get("results", {})
-                    .get("contacts", [])
-            )
-            if nested:
-                contacts.extend(nested)
+        # DEBUG: print raw structure so we can see exactly what the actor returns
+        import json as _j
+        print("\n=== RAW DATASET RESPONSE (first 3000 chars) ===")
+        print(_j.dumps(raw, indent=2)[:3000])
+        print("=== END RAW ===\n")
 
-        print(f"  Fetched {len(contacts)} contacts from dataset")
+        # Try every plausible nesting pattern
+        contacts = []
+        items = raw if isinstance(raw, list) else [raw]
+        for item in items:
+            # Pattern 1: flat list of contact dicts
+            if isinstance(item, dict) and "first_name" in item:
+                contacts.append(item)
+            # Pattern 2: {contacts: {results: {contacts: [...]}}}
+            elif isinstance(item, dict):
+                nested = (item.get("contacts") or {})
+                if isinstance(nested, dict):
+                    nested = (nested.get("results") or {}).get("contacts", [])
+                if isinstance(nested, list):
+                    contacts.extend(nested)
+                # Pattern 3: {results: [...]}
+                elif isinstance(item.get("results"), list):
+                    contacts.extend(item["results"])
+
+        print(f"  Extracted {len(contacts)} contacts")
         return contacts
 
     except Exception as e:
