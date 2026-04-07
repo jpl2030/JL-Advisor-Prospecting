@@ -223,6 +223,13 @@ def collect_prospects():
             print(" done (no more records)")
             break
 
+        # DEBUG — print first record of first batch so we can confirm field names
+        if batch_num == 1:
+            import json as _j
+            print("\n=== FIRST RECORD SAMPLE ===")
+            print(_j.dumps(records[0], indent=2))
+            print("=== END SAMPLE ===\n")
+
         total_fetched += len(records)
         new_count = 0
 
