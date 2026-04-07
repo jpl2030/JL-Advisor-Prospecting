@@ -150,7 +150,10 @@ def search_brokercheck(zip_code, start=0, rows=50):
                     time.sleep(RETRY_DELAY * attempt)
                     continue
                 return None
-        data = resp.json()
+            print(f"\n=== RAW TEXT (zip {zip_code}) ===")
+            print(resp.text[:1000])
+            print("=== END ===\n")
+            data = resp.json()            
             # DEBUG — print raw response for first call only
             import os as _os2
             if _os2.environ.get("DEBUG_FIRST_CALL") == "1":
