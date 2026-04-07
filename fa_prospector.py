@@ -312,28 +312,22 @@ def collect_prospects():
             firm_skip += 1
             continue
 
-        # Geography: get zip from firm's main office if available
+        # Geography: firm_name is available but zip is not in this actor's output.
+        # We queried by firm_state=FL so all records are FL-based.
+        # No zip filter applied — user will refine manually.
         firm_data = rec.get("firms") or {}
-        zip_val   = str(firm_data.get("main_office_postal_code") or
-                        rec.get("zipCode") or "").strip()[:5]
         city      = str(firm_data.get("main_office_city") or
                         rec.get("city") or "").strip().title()
-
-        # Only apply zip filter if we have a zip — otherwise keep (it's FL)
-        if zip_val and not zip_in_central_florida(zip_val):
-            zip_skip += 1
-            continue
+        zip_val   = ""  # not provided by this actor
 
         first = str(rec.get("first_name") or "").strip().title()
         last  = str(rec.get("last_name")  or "").strip().title()
         full_name = f"{first} {last}".strip() or "Unknown"
 
-        # Tenure: use created_at as proxy for first registration if no reg date
-        reg_date_raw = str(rec.get("created_at") or rec.get("updated_at") or "").strip()
-        reg_year     = parse_registration_year(reg_date_raw)
-        if reg_year and reg_year >= REGISTRATION_YEAR_CUTOFF:
-            tenure_skip += 1
-            continue
+        # Tenure: this actor does not include registration dates.
+        # We note the record date for reference but do not filter on it.
+        reg_date_raw = ""
+        reg_year     = None
 
         org_crd    = str(rec.get("organization_crd") or "").strip()
         email      = str(rec.get("email")        or "").strip()
