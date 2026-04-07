@@ -278,7 +278,7 @@ def collect_prospects():
     print(f"  Source: Apify Investment Finance Professionals")
     print(f"{'='*60}\n")
 
-    contacts = run_investment_professionals(state="FL", limit=5000)
+    contacts = run_investment_professionals(state="FL", limit=400)  # $4.02 at $0.01/contact
 
     if not contacts:
         print("  No contacts returned.")
