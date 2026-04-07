@@ -94,97 +94,68 @@ API_DELAY = 0.5
 OUTPUT_FILE = "FA_Prospect_List_CentralFlorida.pdf"
 
 # ─────────────────────────────────────────────
-# BROKERCHECK API
+# FINRA DATA API  (public, no auth required)
 # ─────────────────────────────────────────────
+# Uses the official FINRA Data query API which is server-IP friendly,
+# unlike the BrokerCheck search endpoint which blocks cloud runners.
 
-BASE_URL = "https://api.brokercheck.finra.org/search/individual"
+FINRA_API_URL = "https://api.finra.org/data/group/registration/name/individualBroker"
 
-# Full browser-like headers to avoid being blocked by FINRA CDN/WAF
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://brokercheck.finra.org/",
-    "Origin": "https://brokercheck.finra.org",
-    "Connection": "keep-alive",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-site",
+    "User-Agent": "Mozilla/5.0 (compatible; FA-Prospector/1.0)",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
 }
+
+# Florida state code for filtering
+FL_STATE = "FL"
 
 # Retry settings
 MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds between retries on failure
+RETRY_DELAY = 5
 
 
-def search_brokercheck(zip_code, start=0, rows=50):
-    """Query BrokerCheck public API for individuals near a zip code."""
-    params = {
-        "query": "*",
-        "zip": zip_code,
-        "radius": SEARCH_RADIUS,
-        "hl": "true",
-        "includePrevious": "false",
-        "wt": "json",
-        "sort": "bc_lastname_sort+asc",
-        "start": start,
-        "rows": rows,
-        "r": rows,
-        "type": "individual",
+def fetch_fl_advisors(offset=0, limit=100):
+    """
+    Pull registered individual brokers in Florida from FINRA Data API.
+    Returns list of records or None on failure.
+    """
+    payload = {
+        "compareFilters": [
+            {"fieldName": "stateOfEmployment", "fieldValue": FL_STATE, "compareType": "EQUAL"},
+            {"fieldName": "registrationStatus",  "fieldValue": "A",    "compareType": "EQUAL"},
+        ],
+        "fields": [
+            "individualId", "firstName", "lastName", "middleName",
+            "firmId", "firmName", "city", "stateOfEmployment", "zipCode",
+            "registrationDate", "licenseType",
+        ],
+        "limit": limit,
+        "offset": offset,
+        "sortFields": [{"fieldName": "lastName", "sortType": "ASC"}],
     }
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.get(
-                BASE_URL, params=params, headers=HEADERS,
-                timeout=20, allow_redirects=True
+            resp = requests.post(
+                FINRA_API_URL, json=payload, headers=HEADERS, timeout=30
             )
-            if resp.status_code != 200:
-                print(f"    [!] HTTP {resp.status_code} for zip {zip_code} "
-                      f"(attempt {attempt}): {resp.text[:200]}")
+            print(f"    [API] offset={offset} status={resp.status_code}")
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                print(f"    [!] HTTP {resp.status_code}: {resp.text[:300]}")
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY * attempt)
-                    continue
-                return None
-            print(f"\n=== RAW TEXT (zip {zip_code}) ===")
-            print(resp.text[:1000])
-            print("=== END ===\n")
-            data = resp.json()            
-            # DEBUG — print raw response for first call only
-            import os as _os2
-            if _os2.environ.get("DEBUG_FIRST_CALL") == "1":
-                import json as _json2
-                print("\n=== RAW API RESPONSE ===")
-                print(_json2.dumps(data, indent=2)[:3000])
-                print("=== END RAW RESPONSE ===\n")
-                _os2.environ["DEBUG_FIRST_CALL"] = "0"
-            if "hits" not in data:
-                print(f"    [!] Unexpected response for zip {zip_code}: "
-                      f"{str(data)[:200]}")
-                return None
-            return data
         except requests.exceptions.RequestException as e:
-            print(f"    [!] Request error for zip {zip_code} "
-                  f"(attempt {attempt}): {e}")
+            print(f"    [!] Request error (attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
     return None
 
 
-def get_individual_detail(ind_crd):
-    """Fetch detailed record for a specific CRD number."""
-    url = f"https://api.brokercheck.finra.org/search/individual/{ind_crd}"
-    params = {"hl": "true", "includePrevious": "true", "wt": "json"}
-    try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.RequestException:
-        return None
+def zip_in_central_florida(zip_code):
+    """Return True if the zip code is in our Central Florida target list."""
+    return str(zip_code).strip()[:5] in set(CENTRAL_FLORIDA_ZIPS)
 
 
 def parse_registration_year(date_str):
@@ -217,120 +188,117 @@ def firm_excluded(firm_name):
 # ─────────────────────────────────────────────
 
 def collect_prospects():
-    """Pull and filter advisors across all Central Florida zip codes."""
-    seen_crds = set()
+    """
+    Pull FL advisors from FINRA Data API in paginated batches,
+    then filter for Central Florida zips, tenure, and firm type.
+    """
+    seen_ids = set()
     all_prospects = []
-    total_zips = len(CENTRAL_FLORIDA_ZIPS)
+    offset = 0
+    batch_size = 100
+    total_fetched = 0
+    batch_num = 0
 
     print(f"\n{'='*60}")
     print(f"  FA PROSPECTOR — Central Florida")
     print(f"  Registration cutoff: before {REGISTRATION_YEAR_CUTOFF}")
-    print(f"  Searching {total_zips} zip codes...")
+    print(f"  Pulling Florida advisors from FINRA Data API...")
     print(f"{'='*60}\n")
 
-    for idx, zip_code in enumerate(CENTRAL_FLORIDA_ZIPS, 1):
-        print(f"[{idx:>3}/{total_zips}] Zip {zip_code}...", end="", flush=True)
+    while True:
+        batch_num += 1
+        print(f"  Batch {batch_num} (offset={offset})...", end="", flush=True)
 
-        data = search_brokercheck(zip_code, start=0, rows=MAX_RESULTS_PER_ZIP)
-        if not data:
-            print(" skip (error)")
-            continue
+        records = fetch_fl_advisors(offset=offset, limit=batch_size)
 
-        try:
-            hits = data.get("hits", {}).get("hits", [])
-            total_found = data.get("hits", {}).get("total", 0)
-        except (AttributeError, KeyError):
-            print(" skip (parse error)")
-            continue
+        if records is None:
+            print(" API error — stopping")
+            break
 
-        # DEBUG — print first zip's raw response so we can see field names
-        if idx == 1 and hits:
-            import json as _json
-            print("\n=== DEBUG SAMPLE (first result) ===")
-            print(_json.dumps(hits[0].get("_source", {}), indent=2)[:2000])
-            print("=== END DEBUG ===\n")
+        if not isinstance(records, list):
+            print(f" unexpected response type: {type(records)} — {str(records)[:200]}")
+            break
 
+        if len(records) == 0:
+            print(" done (no more records)")
+            break
+
+        total_fetched += len(records)
         new_count = 0
-        for hit in hits:
-            src = hit.get("_source", {})
-            ind_crd = src.get("ind_source_id") or hit.get("_id", "")
 
-            if not ind_crd or ind_crd in seen_crds:
+        for rec in records:
+            ind_id = str(rec.get("individualId", "")).strip()
+            if not ind_id or ind_id in seen_ids:
                 continue
-            seen_crds.add(ind_crd)
+            seen_ids.add(ind_id)
 
-            # --- Basic fields from search result ---
-            first = src.get("ind_firstname", "").strip()
-            last = src.get("ind_lastname", "").strip()
+            # Geography filter — must be in Central FL zip list
+            zip_val = str(rec.get("zipCode", "")).strip()[:5]
+            if not zip_in_central_florida(zip_val):
+                continue
+
+            first = str(rec.get("firstName", "")).strip().title()
+            last  = str(rec.get("lastName",  "")).strip().title()
             full_name = f"{first} {last}".strip() or "Unknown"
 
-            firm = src.get("ind_bc_employer", "") or src.get("ind_employed_by", "")
-            if isinstance(firm, list):
-                firm = firm[0] if firm else ""
-            firm = firm.strip()
+            firm = str(rec.get("firmName", "")).strip()
 
-            # Exclude undesirable firms immediately
+            # Firm exclusion filter
             if firm_excluded(firm):
                 continue
 
-            # Registration date
-            reg_date_raw = (
-                src.get("ind_bc_registration_bgn_dt")
-                or src.get("ind_registration_date")
-                or src.get("ind_bc_current_employer_registration_bgn_dt")
-                or ""
-            )
+            # Registration date / tenure filter
+            reg_date_raw = str(rec.get("registrationDate", "")).strip()
             reg_year = parse_registration_year(reg_date_raw)
-
-            # Filter: only advisors registered before cutoff year
             if reg_year and reg_year >= REGISTRATION_YEAR_CUTOFF:
                 continue
 
-            # --- Collect remaining fields ---
-            state = src.get("ind_bc_address_state", "FL")
-            city = src.get("ind_bc_address_city", "").strip().title()
-            zip_val = src.get("ind_bc_address_zip5", zip_code)
-            has_disclosures = src.get("ind_has_complaints", False) or src.get("ind_bc_disclosures_fl", False)
-            disclosures_count = src.get("ind_num_bc_complaints", 0)
-            licenses_raw = src.get("ind_licenses", [])
-            if isinstance(licenses_raw, list):
-                licenses = ", ".join(licenses_raw) if licenses_raw else "N/A"
-            else:
-                licenses = str(licenses_raw)
+            city     = str(rec.get("city", "")).strip().title()
+            state    = str(rec.get("stateOfEmployment", "FL")).strip()
+            firm_id  = str(rec.get("firmId", "")).strip()
+            licenses = str(rec.get("licenseType", "N/A")).strip()
 
-            broker_url = f"https://brokercheck.finra.org/individual/summary/{ind_crd}"
+            broker_url = f"https://brokercheck.finra.org/individual/summary/{ind_id}"
 
             prospect = {
-                "name": full_name,
-                "first": first,
-                "last": last,
-                "crd": ind_crd,
-                "firm": firm or "Unknown",
-                "city": city,
-                "state": state,
-                "zip": zip_val,
-                "reg_year": reg_year,
-                "reg_date_raw": reg_date_raw,
+                "name":             full_name,
+                "first":            first,
+                "last":             last,
+                "crd":              ind_id,
+                "firm":             firm or "Unknown",
+                "city":             city,
+                "state":            state,
+                "zip":              zip_val,
+                "reg_year":         reg_year,
+                "reg_date_raw":     reg_date_raw,
                 "years_in_industry": (datetime.now().year - reg_year) if reg_year else None,
-                "has_disclosures": has_disclosures,
-                "disclosures_count": disclosures_count,
-                "licenses": licenses,
-                "brokercheck_url": broker_url,
-                "phone": "",        # To be filled manually
-                "email": "",        # To be filled manually
-                "linkedin": "",     # To be filled manually
-                "notes": "",        # To be filled manually
+                "has_disclosures":  False,
+                "disclosures_count": 0,
+                "licenses":         licenses,
+                "brokercheck_url":  broker_url,
+                "phone":            "",
+                "email":            "",
+                "linkedin":         "",
+                "notes":            "",
             }
             all_prospects.append(prospect)
             new_count += 1
 
-        time.sleep(API_DELAY)
-        print(f" {new_count} new prospects (total={len(all_prospects)})")
+        print(f" {new_count} added (running total={len(all_prospects)}, fetched={total_fetched})")
 
-    # Sort: earliest registration first (most senior advisors at top)
+        if len(records) < batch_size:
+            print("  Reached end of dataset.")
+            break
+
+        offset += batch_size
+        time.sleep(API_DELAY)
+
+    # Sort: earliest registration first (most senior at top)
     all_prospects.sort(key=lambda x: x.get("reg_year") or 9999)
 
-    print(f"\n✅ Collection complete. Total prospects: {len(all_prospects)}")
+    print(f"\n✅ Collection complete.")
+    print(f"   Total FL records fetched: {total_fetched}")
+    print(f"   Prospects after all filters: {len(all_prospects)}")
     return all_prospects
 
 
