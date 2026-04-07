@@ -94,55 +94,62 @@ API_DELAY = 0.5
 OUTPUT_FILE = "FA_Prospect_List_CentralFlorida.pdf"
 
 # ─────────────────────────────────────────────
-# SEC IAPD API  (fully public, no auth required)
+# SEC FORM ADV BULK CSV DOWNLOAD
 # ─────────────────────────────────────────────
-# SEC Investment Adviser Public Disclosure — free, no token needed,
-# works from any IP including GitHub Actions runners.
+# The SEC publishes complete Form ADV data as downloadable ZIP/CSV files.
+# No API key, no auth, no IP blocking — just a direct file download.
+# Individual representatives are in the IA_REP table.
+# Published at: https://adviserinfo.sec.gov/adv
 
-IAPD_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index?q=%22financial+advisor%22&dateRange=custom&startdt=1970-01-01&enddt={cutoff}&forms=ADV"
-IAPD_INDIVIDUAL_URL = "https://www.adviserinfo.sec.gov/api/Individual/Search"
+import io
+import zipfile
+import csv
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FA-Prospector/1.0)",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (compatible; FA-Prospector/1.0; research@example.com)",
+    "Accept": "*/*",
 }
+
+# The SEC ADV bulk data ZIP — individual representatives table
+# This URL is stable and updated daily by the SEC
+ADV_REP_URL = "https://files.adviserinfo.sec.gov/IAPD/Content/Common/crd_iapd_Current_1A_InvAdvrRep.zip"
 
 # Retry settings
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
 
-def fetch_iapd_advisors(last_name_prefix="A", state="FL", start=0, count=100):
+def download_adv_reps():
     """
-    Query SEC IAPD individual search by state and last name prefix.
-    Returns list of advisor dicts or None on failure.
+    Download and parse the SEC Form ADV individual representatives CSV.
+    Returns list of row dicts or None on failure.
     """
-    params = {
-        "query": last_name_prefix,
-        "state": state,
-        "start": start,
-        "count": count,
-    }
+    print("  Downloading SEC Form ADV representatives dataset...")
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.get(
-                IAPD_INDIVIDUAL_URL,
-                params=params,
-                headers=HEADERS,
-                timeout=20,
+                ADV_REP_URL, headers=HEADERS,
+                timeout=120, stream=True
             )
-            print(f"    [API] prefix={last_name_prefix} start={start} status={resp.status_code}")
+            print(f"  HTTP {resp.status_code} — ", end="", flush=True)
             if resp.status_code == 200:
-                data = resp.json()
-                # IAPD returns {"hits": {"hits": [...], "total": N}}
-                hits = data.get("hits", {}).get("hits", [])
-                return hits
+                raw = resp.content
+                print(f"{len(raw):,} bytes downloaded")
+                zf = zipfile.ZipFile(io.BytesIO(raw))
+                # Find the CSV inside the zip
+                csv_name = [n for n in zf.namelist() if n.lower().endswith('.csv')][0]
+                print(f"  Parsing {csv_name}...")
+                with zf.open(csv_name) as f:
+                    reader = csv.DictReader(io.TextIOWrapper(f, encoding='utf-8', errors='replace'))
+                    rows = list(reader)
+                print(f"  Total rows in dataset: {len(rows):,}")
+                return rows
             else:
-                print(f"    [!] HTTP {resp.status_code}: {resp.text[:300]}")
+                print(f"failed: {resp.text[:200]}")
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY * attempt)
         except Exception as e:
-            print(f"    [!] Error (attempt {attempt}): {e}")
+            print(f"Error (attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
     return None
@@ -184,154 +191,136 @@ def firm_excluded(firm_name):
 
 def collect_prospects():
     """
-    Sweep SEC IAPD by last-name prefix A-Z to pull all FL registered advisors,
-    then filter for Central FL zips, tenure, and firm exclusions.
+    Download SEC Form ADV bulk CSV, filter for Central FL zip codes,
+    tenure cutoff, and firm exclusions.
     """
-    import string
-    seen_ids = set()
-    all_prospects = []
-    total_fetched = 0
-
     print(f"\n{'='*60}")
     print(f"  FA PROSPECTOR — Central Florida")
     print(f"  Registration cutoff: before {REGISTRATION_YEAR_CUTOFF}")
-    print(f"  Source: SEC IAPD — sweeping A-Z by last name prefix")
+    print(f"  Source: SEC Form ADV bulk CSV download")
     print(f"{'='*60}\n")
 
-    prefixes = list(string.ascii_uppercase)
+    rows = download_adv_reps()
 
-    for prefix in prefixes:
-        start = 0
-        batch_size = 100
-        prefix_total = 0
+    if rows is None:
+        print("  Failed to download SEC dataset.")
+        return []
 
-        while True:
-            print(f"  [{prefix}] offset={start}...", end="", flush=True)
-            hits = fetch_iapd_advisors(
-                last_name_prefix=prefix, state="FL",
-                start=start, count=batch_size
-            )
+    if rows:
+        print("\n=== COLUMN NAMES IN DATASET ===")
+        print(list(rows[0].keys())[:30])
+        print("=== FIRST ROW SAMPLE ===")
+        import json as _j
+        print(_j.dumps(dict(list(rows[0].items())[:20]), indent=2))
+        print("=== END SAMPLE ===\n")
 
-            if hits is None:
-                print(" error — skipping")
-                break
+    all_prospects = []
+    seen_ids = set()
+    fl_count = 0
+    zip_count = 0
+    tenure_count = 0
+    firm_count = 0
 
-            if len(hits) == 0:
-                print(" done")
-                break
+    print(f"  Filtering {len(rows):,} records...")
 
-            # DEBUG: print first record of very first batch
-            if prefix == "A" and start == 0 and hits:
-                import json as _j
-                print("\n=== FIRST RECORD SAMPLE ===")
-                print(_j.dumps(hits[0], indent=2)[:1500])
-                print("=== END SAMPLE ===\n")
+    for row in rows:
+        # Try multiple possible column names for each field
+        # (SEC CSV column names vary — debug sample will confirm exact names)
+        ind_id = str(
+            row.get("CRDNumber") or row.get("IndvlId") or
+            row.get("CRD_NUMBER") or row.get("indvl_id") or ""
+        ).strip()
 
-            total_fetched += len(hits)
-            new_count = 0
+        if not ind_id or ind_id in seen_ids:
+            continue
+        seen_ids.add(ind_id)
 
-            for hit in hits:
-                src = hit.get("_source", hit)  # handle both wrapped and flat
+        # State filter — Florida only
+        state = str(
+            row.get("StateCode") or row.get("state_cd") or
+            row.get("State") or row.get("STATE") or ""
+        ).strip().upper()
+        if state != "FL":
+            continue
+        fl_count += 1
 
-                ind_id = str(
-                    src.get("ind_source_id") or
-                    src.get("individualId") or
-                    hit.get("_id", "")
-                ).strip()
+        # Zip filter — Central Florida only
+        zip_val = str(
+            row.get("ZipCode") or row.get("zip_cd") or
+            row.get("Zip") or row.get("ZIP") or ""
+        ).strip()[:5]
+        if not zip_in_central_florida(zip_val):
+            continue
+        zip_count += 1
 
-                if not ind_id or ind_id in seen_ids:
-                    continue
-                seen_ids.add(ind_id)
+        # Firm exclusion
+        firm = str(
+            row.get("FirmName") or row.get("firm_name") or
+            row.get("OrgNm") or row.get("ORG_NM") or ""
+        ).strip()
+        if firm_excluded(firm):
+            continue
+        firm_count += 1
 
-                # Geography — must be Central FL zip
-                zip_val = str(
-                    src.get("ind_bc_address_zip5") or
-                    src.get("zipCode") or
-                    src.get("zip", "")
-                ).strip()[:5]
-                if not zip_in_central_florida(zip_val):
-                    continue
+        # Tenure filter
+        reg_date_raw = str(
+            row.get("RegistrationDate") or row.get("reg_dt") or
+            row.get("InitialRegistrationDate") or row.get("INIT_REG_DT") or ""
+        ).strip()
+        reg_year = parse_registration_year(reg_date_raw)
+        if reg_year and reg_year >= REGISTRATION_YEAR_CUTOFF:
+            continue
+        tenure_count += 1
 
-                first = str(
-                    src.get("ind_firstname") or
-                    src.get("firstName", "")
-                ).strip().title()
-                last = str(
-                    src.get("ind_lastname") or
-                    src.get("lastName", "")
-                ).strip().title()
-                full_name = f"{first} {last}".strip() or "Unknown"
+        first = str(
+            row.get("FirstName") or row.get("first_nm") or
+            row.get("FIRST_NM") or ""
+        ).strip().title()
+        last = str(
+            row.get("LastName") or row.get("last_nm") or
+            row.get("LAST_NM") or ""
+        ).strip().title()
+        full_name = f"{first} {last}".strip() or "Unknown"
 
-                firm = str(
-                    src.get("ind_bc_employer") or
-                    src.get("firmName") or
-                    src.get("currentEmployments", [{}])[0].get("firmName", "") if src.get("currentEmployments") else ""
-                ).strip()
+        city = str(
+            row.get("City") or row.get("city") or
+            row.get("CITY") or ""
+        ).strip().title()
 
-                if firm_excluded(firm):
-                    continue
+        broker_url = f"https://brokercheck.finra.org/individual/summary/{ind_id}"
 
-                reg_date_raw = str(
-                    src.get("ind_bc_registration_bgn_dt") or
-                    src.get("registrationDate") or
-                    src.get("ind_registration_date", "")
-                ).strip()
-                reg_year = parse_registration_year(reg_date_raw)
-
-                if reg_year and reg_year >= REGISTRATION_YEAR_CUTOFF:
-                    continue
-
-                city = str(
-                    src.get("ind_bc_address_city") or
-                    src.get("city", "")
-                ).strip().title()
-
-                licenses_raw = src.get("ind_licenses") or src.get("licenseType", "N/A")
-                if isinstance(licenses_raw, list):
-                    licenses = ", ".join(licenses_raw) if licenses_raw else "N/A"
-                else:
-                    licenses = str(licenses_raw)
-
-                broker_url = f"https://brokercheck.finra.org/individual/summary/{ind_id}"
-
-                prospect = {
-                    "name":              full_name,
-                    "first":             first,
-                    "last":              last,
-                    "crd":               ind_id,
-                    "firm":              firm or "Unknown",
-                    "city":              city,
-                    "state":             "FL",
-                    "zip":               zip_val,
-                    "reg_year":          reg_year,
-                    "reg_date_raw":      reg_date_raw,
-                    "years_in_industry": (datetime.now().year - reg_year) if reg_year else None,
-                    "has_disclosures":   False,
-                    "disclosures_count": 0,
-                    "licenses":          licenses,
-                    "brokercheck_url":   broker_url,
-                    "phone":             "",
-                    "email":             "",
-                    "linkedin":          "",
-                    "notes":             "",
-                }
-                all_prospects.append(prospect)
-                new_count += 1
-                prefix_total += 1
-
-            print(f" +{new_count} prospects (total={len(all_prospects)}, fetched={total_fetched})")
-
-            if len(hits) < batch_size:
-                break
-
-            start += batch_size
-            time.sleep(API_DELAY)
+        prospect = {
+            "name":              full_name,
+            "first":             first,
+            "last":              last,
+            "crd":               ind_id,
+            "firm":              firm or "Unknown",
+            "city":              city,
+            "state":             "FL",
+            "zip":               zip_val,
+            "reg_year":          reg_year,
+            "reg_date_raw":      reg_date_raw,
+            "years_in_industry": (datetime.now().year - reg_year) if reg_year else None,
+            "has_disclosures":   False,
+            "disclosures_count": 0,
+            "licenses":          "N/A",
+            "brokercheck_url":   broker_url,
+            "phone":             "",
+            "email":             "",
+            "linkedin":          "",
+            "notes":             "",
+        }
+        all_prospects.append(prospect)
 
     all_prospects.sort(key=lambda x: x.get("reg_year") or 9999)
 
-    print(f"\n✅ Collection complete.")
-    print(f"   Total IAPD records fetched: {total_fetched}")
-    print(f"   Prospects after all filters: {len(all_prospects)}")
+    print(f"\n  Filter funnel:")
+    print(f"    Total rows:          {len(rows):>6,}")
+    print(f"    Florida reps:        {fl_count:>6,}")
+    print(f"    Central FL zips:     {zip_count:>6,}")
+    print(f"    After firm filter:   {firm_count:>6,}")
+    print(f"    After tenure filter: {tenure_count:>6,}")
+    print(f"\n✅ Final prospect count: {len(all_prospects):,}")
     return all_prospects
 
 # ─────────────────────────────────────────────
