@@ -232,6 +232,13 @@ def collect_prospects():
             print(" skip (parse error)")
             continue
 
+        # DEBUG — print first zip's raw response so we can see field names
+        if idx == 1 and hits:
+            import json as _json
+            print("\n=== DEBUG SAMPLE (first result) ===")
+            print(_json.dumps(hits[0].get("_source", {}), indent=2)[:2000])
+            print("=== END DEBUG ===\n")
+
         new_count = 0
         for hit in hits:
             src = hit.get("_source", {})
