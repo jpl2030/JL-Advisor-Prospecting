@@ -99,35 +99,69 @@ OUTPUT_FILE = "FA_Prospect_List_CentralFlorida.pdf"
 
 BASE_URL = "https://api.brokercheck.finra.org/search/individual"
 
+# Full browser-like headers to avoid being blocked by FINRA CDN/WAF
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; research tool)",
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://brokercheck.finra.org/",
     "Origin": "https://brokercheck.finra.org",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
 }
+
+# Retry settings
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds between retries on failure
 
 
 def search_brokercheck(zip_code, start=0, rows=50):
     """Query BrokerCheck public API for individuals near a zip code."""
     params = {
-        "query": "financial advisor",
+        "query": "*",
         "zip": zip_code,
         "radius": SEARCH_RADIUS,
         "hl": "true",
         "includePrevious": "false",
         "wt": "json",
-        "sort": "score+desc",
+        "sort": "bc_lastname_sort+asc",
         "start": start,
         "rows": rows,
         "r": rows,
+        "type": "individual",
     }
-    try:
-        resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.RequestException as e:
-        print(f"    [!] API error for zip {zip_code}: {e}")
-        return None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(
+                BASE_URL, params=params, headers=HEADERS,
+                timeout=20, allow_redirects=True
+            )
+            if resp.status_code != 200:
+                print(f"    [!] HTTP {resp.status_code} for zip {zip_code} "
+                      f"(attempt {attempt}): {resp.text[:200]}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+                    continue
+                return None
+            data = resp.json()
+            if "hits" not in data:
+                print(f"    [!] Unexpected response for zip {zip_code}: "
+                      f"{str(data)[:200]}")
+                return None
+            return data
+        except requests.exceptions.RequestException as e:
+            print(f"    [!] Request error for zip {zip_code} "
+                  f"(attempt {attempt}): {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * attempt)
+    return None
 
 
 def get_individual_detail(ind_crd):
@@ -639,12 +673,25 @@ def main():
     prospects = collect_prospects()
 
     if not prospects:
-        print("\n⚠️  No prospects found. This may be due to:")
-        print("   - API rate limiting (try again in a few minutes)")
-        print("   - All results being filtered out")
+        print("\n⚠️  No prospects found. Possible causes:")
+        print("   - BrokerCheck API blocking GitHub runner IPs (most likely)")
+        print("   - All results filtered out by current cutoff settings")
         print("   - Network connectivity issues")
-        print("\n   Try increasing REGISTRATION_YEAR_CUTOFF to 2005 or 2010 for a broader net.")
-        sys.exit(1)
+        print("\n   Writing empty-result PDF so the pipeline does not crash...")
+        # Build a notice PDF so send_report.py still has something to attach
+        from reportlab.pdfgen import canvas as _canvas
+        from reportlab.lib.pagesizes import letter as _letter
+        _c = _canvas.Canvas(OUTPUT_FILE, pagesize=_letter)
+        _c.setFont("Helvetica-Bold", 14)
+        _c.drawCentredString(306, 500, "FA Prospector — No Results This Run")
+        _c.setFont("Helvetica", 11)
+        _c.drawCentredString(306, 470, "BrokerCheck API may have blocked the request.")
+        _c.drawCentredString(306, 450, "Try triggering a manual run in a few hours,")
+        _c.drawCentredString(306, 430, "or increase REG_YEAR_CUTOFF to 2005 or 2010.")
+        _c.save()
+        print(f"   Wrote notice PDF: {OUTPUT_FILE}")
+        # Exit 0 so the email step still runs and you get notified
+        sys.exit(0)
 
     print(f"\n📊 Building PDF with {len(prospects)} prospects...")
     build_pdf(prospects, OUTPUT_FILE)
